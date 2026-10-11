@@ -19,7 +19,7 @@
         <section class="intro">
           <p class="eyebrow">IN YOUR BROWSER. ON YOUR DEVICE.</p>
           <h1>Restore a clean<br /><span>video frame.</span></h1>
-          <p class="intro-copy">Select a small watermark area. Browser-based AI reconstructs it on the first frame and applies that patch to the clip. Your video is not uploaded.</p>
+          <p class="intro-copy">Select the watermark area. Browser-based AI reconstructs that area independently in every video frame. Your video is not uploaded.</p>
         </section>
 
         <section class="workspace" aria-label="Video editor">
@@ -44,7 +44,7 @@
             </div>
             <div class="result-preview" id="result-preview" hidden><div class="result-label">AI RESULT · REVIEW BEFORE DOWNLOADING</div><video id="result-video" controls playsinline aria-label="AI inpainted result preview"></video></div>
             <div class="preview-footer"><span id="video-facts">No video selected</span><button class="text-button" id="replace-button" type="button" hidden>Replace video</button></div>
-            <div class="tip-line"><span class="tip-star">✳</span><span><strong>Tip:</strong> Cover the whole mark and leave a little margin. This method works best with a stationary watermark over a mostly static background.</span></div>
+            <div class="tip-line"><span class="tip-star">✳</span><span><strong>Tip:</strong> Keep the watermark inside the selected box for the whole clip. Each frame is repaired separately, so moving backgrounds are not covered by a frozen patch.</span></div>
 
             <div class="section-heading edit-heading"><span class="step-number">02</span><div><h2>Select the watermark</h2><p>Drag and resize the box to cover the mark.</p></div></div>
           </div>
@@ -57,7 +57,7 @@
             <button class="process-button" id="process-button" type="button" disabled><span id="process-label">Choose a video</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
             <div class="progress-wrap" id="progress-wrap" hidden><div class="progress-copy"><span id="progress-label">Preparing AI…</span><span id="progress-value">0%</span></div><div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div></div>
             <a class="download-button" id="download-button" hidden download="framefix-edited.webm">Download edited video <span>↓</span></a>
-            <div class="honesty-note"><span class="note-icon">i</span><p>This one-patch method can look blurry or ghosted if the watermark or the scene behind it moves. It works best for static marks. The browser downloads the ~29 MB model once and then caches it on your device.</p></div>
+            <div class="honesty-note"><span class="note-icon">i</span><p>Every frame runs through AI separately, so processing takes longer and results may vary slightly between frames. The selected box stays at the same screen position. The browser downloads the ~29 MB model once and then caches it on your device.</p></div>
           </aside>
         </section>
         <p class="footer-note">No account. No video upload. No app server. <span>♥</span> Your video stays under your control.<br /><a href="./terms.html">Terms of Use</a> · <a href="https://myndrix.space/" target="_blank" rel="noopener noreferrer">myndrix.space</a> · Built by <a href="https://sukhbeer.im/" target="_blank" rel="noopener noreferrer">Sukhbeer Kumar</a></p>

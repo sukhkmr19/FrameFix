@@ -1,20 +1,20 @@
 # FrameFix
 
-FrameFix is a static GitHub Pages video editor that performs AI inpainting in the browser. It adapts the publicly documented approach used by [WatermarkOut](https://github.com/IamRamgarhia/free-ai-watermark-remover): ONNX Runtime Web runs MI-GAN locally, and a patch reconstructed from the first frame is applied to the video during browser playback. There is no application server and video files are not uploaded.
+FrameFix is a static GitHub Pages video editor that performs AI inpainting in the browser. ONNX Runtime Web runs MI-GAN locally, and the selected region is reconstructed independently for every decoded video frame. There is no application server and video files are not uploaded.
 
 ## What it does
 
 - Upload and preview MP4, MOV, and WebM clips.
 - Drag and resize a rectangular selection over the watermark.
-- Run MI-GAN image inpainting on the selected area of the first frame.
-- Record the video with that reconstructed patch applied and preserve audio when the browser exposes it.
+- Run MI-GAN image inpainting on the selected area of every frame.
+- Export the repaired frames with the source playback timing and audio track.
 - Cache the ~29 MB model in IndexedDB after its first download.
 - Provide an English interface and Terms of Use.
 - Deploy as a static site to GitHub Pages.
 
 ## Honest limitations
 
-The model runs once on the first frame; the reconstructed patch is reused for the entire clip. This is suited to a stationary watermark over a mostly stationary background. If the background moves, the result can look like a frozen patch or ghosting. This is not full temporal video inpainting. Use short clips and review the exported result.
+The model runs separately for each decoded frame, so processing takes longer than one-pass image repair and results can vary slightly between frames. The selection stays at one screen position; the watermark must remain inside the selected box throughout the clip. Browser memory limits may require a shorter clip or smaller selection. Review the exported result.
 
 GitHub Pages serves static files. All inference and recording run on the visitor's device. The first use downloads ONNX Runtime Web from jsDelivr and the model (~29 MB) from Hugging Face; subsequent model use is cached in the browser. Inference speed, video codec support, memory, and audio capture depend on the device and browser. Export is WebM or MP4 according to MediaRecorder support.
 

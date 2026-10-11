@@ -1,32 +1,6 @@
 /**
- * Video pipeline — pure browser, no ffmpeg.
- *
- * STRATEGY (post-debug rewrite):
- *
- *   1. Run AI inpainting ONCE on the first frame to get the clean pixels for
- *      the masked region. This is the only expensive step.
- *
- *   2. Build a "patch canvas" — RGBA where the masked region holds those
- *      clean pixels and everything else is transparent.
- *
- *   3. Play the source video at 1× speed. On each decoded frame:
- *        - draw the frame onto the output canvas
- *        - draw the patch on top (only paints the masked area)
- *      Use requestVideoFrameCallback for frame-accurate, real-time capture.
- *
- *   4. MediaRecorder captures the output canvas whenever a new frame is drawn
- *      + the original audio track in real time. Result: a video of identical
- *      duration with the watermark replaced by the patch.
- *
- * Why playback-based instead of seek-based:
- *   MediaRecorder records in WALL-CLOCK time. captureStream(0) with manual
- *   requestFrame produced misshapen output (long duration, wrong fps) when
- *   the seek loop took longer than the video. Playback at 1× guarantees the
- *   output duration matches input.
- *
- * Total time:
- *   1× AI inference (~10–20s on WASM, ~2-3s on WebGPU) + video duration.
- *   A 10s clip → ~20–30s total. (No way to go faster without changing models.)
+ * Browser-only video inpainting. Every displayed source frame is inpainted
+ * independently; no repaired pixels are reused from a different frame.
  */
 
 export async function loadVideoMetadata(file) {
@@ -53,211 +27,271 @@ export async function loadVideoMetadata(file) {
   };
 }
 
-export async function grabFirstFrame(video) {
-  if (video.readyState < 2) {
-    await new Promise(r => video.addEventListener('loadeddata', r, { once: true }));
-  }
-  video.currentTime = 0;
-  await new Promise(r => video.addEventListener('seeked', r, { once: true }));
-
-  const canvas = document.createElement('canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  canvas.getContext('2d').drawImage(video, 0, 0);
-  return canvas;
-}
-
-/**
- * Build a transparent-backed canvas where only the masked region holds the
- * inpainted clean pixels (with feathered alpha at edges for seamless blending).
- */
-function buildPatchCanvas(inpaintedImage, maskImage, featherRadius = 6) {
-  const { width: w, height: h } = inpaintedImage;
-  const patch = new ImageData(w, h);
-  for (let i = 0; i < w * h; i++) {
-    const a = maskImage.data[i * 4 + 3];
-    if (a > 16) {
-      patch.data[i * 4 + 0] = inpaintedImage.data[i * 4 + 0];
-      patch.data[i * 4 + 1] = inpaintedImage.data[i * 4 + 1];
-      patch.data[i * 4 + 2] = inpaintedImage.data[i * 4 + 2];
-      patch.data[i * 4 + 3] = 255;
+function findMaskBounds(mask) {
+  let left = mask.width;
+  let top = mask.height;
+  let right = -1;
+  let bottom = -1;
+  for (let y = 0; y < mask.height; y++) {
+    for (let x = 0; x < mask.width; x++) {
+      if (mask.data[(y * mask.width + x) * 4 + 3] <= 16) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
     }
   }
-  const baseCanvas = new OffscreenCanvas(w, h);
-  baseCanvas.getContext('2d').putImageData(patch, 0, 0);
-
-  const featherCanvas = new OffscreenCanvas(w, h);
-  const fctx = featherCanvas.getContext('2d');
-  fctx.filter = `blur(${featherRadius}px)`;
-  fctx.drawImage(baseCanvas, 0, 0);
-  fctx.filter = 'none';
-  return featherCanvas;
+  if (right < left || bottom < top) throw new Error('Select the watermark area first.');
+  const feather = 8;
+  const x = Math.max(0, left - feather);
+  const y = Math.max(0, top - feather);
+  const r = Math.min(mask.width, right + feather + 1);
+  const b = Math.min(mask.height, bottom + feather + 1);
+  return { x, y, width: r - x, height: b - y };
 }
 
-/**
- * Process a video. Returns a Blob of the output video.
- */
+function seekTo(video, time) {
+  if (Math.abs(video.currentTime - time) < 0.0005 && video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error('Timed out while decoding a video frame.')), 10000);
+    const finish = (error) => {
+      clearTimeout(timer);
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('error', onError);
+      error ? reject(error) : resolve();
+    };
+    const onSeeked = () => finish();
+    const onError = () => finish(new Error('Could not decode a video frame.'));
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('error', onError, { once: true });
+    video.currentTime = time;
+  });
+}
+
+async function collectFrameTimes(video, duration) {
+  await seekTo(video, 0);
+  if (typeof video.requestVideoFrameCallback !== 'function') {
+    // Legacy-browser fallback. Modern Chrome, Firefox, and Safari use the
+    // decoder's actual per-frame media timestamps below.
+    const times = [];
+    for (let t = 0; t < duration; t += 1 / 30) times.push(t);
+    return times;
+  }
+
+  const times = [0];
+  video.muted = true;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(safetyTimer);
+      video.removeEventListener('ended', onEnded);
+      video.removeEventListener('error', onError);
+      video.pause();
+      error ? reject(error) : resolve(times);
+    };
+    const onEnded = () => finish();
+    const onError = () => finish(new Error('Video playback failed while reading its frames.'));
+    const safetyTimer = setTimeout(() => finish(new Error('Timed out while reading video frames.')), (duration + 10) * 2 * 1000);
+    video.addEventListener('ended', onEnded, { once: true });
+    video.addEventListener('error', onError, { once: true });
+
+    const readFrame = (_now, metadata) => {
+      const time = metadata.mediaTime;
+      if (Number.isFinite(time) && time > times[times.length - 1] + 0.0001 && time < duration) {
+        times.push(time);
+      }
+      if (!settled && !video.ended) video.requestVideoFrameCallback(readFrame);
+    };
+    video.requestVideoFrameCallback(readFrame);
+    video.play().catch((error) => finish(new Error(`Could not read video frames: ${error.message || error}`)));
+  });
+}
+
+async function makePatchBlob(inpainted, mask, bounds) {
+  const base = document.createElement('canvas');
+  base.width = bounds.width;
+  base.height = bounds.height;
+  const context = base.getContext('2d');
+  const patch = context.createImageData(bounds.width, bounds.height);
+  for (let y = 0; y < bounds.height; y++) {
+    for (let x = 0; x < bounds.width; x++) {
+      const sourceIndex = ((bounds.y + y) * mask.width + bounds.x + x) * 4;
+      const targetIndex = (y * bounds.width + x) * 4;
+      if (mask.data[sourceIndex + 3] > 16) {
+        patch.data[targetIndex] = inpainted.data[sourceIndex];
+        patch.data[targetIndex + 1] = inpainted.data[sourceIndex + 1];
+        patch.data[targetIndex + 2] = inpainted.data[sourceIndex + 2];
+        patch.data[targetIndex + 3] = 255;
+      }
+    }
+  }
+  context.putImageData(patch, 0, 0);
+
+  const softened = document.createElement('canvas');
+  softened.width = bounds.width;
+  softened.height = bounds.height;
+  const softContext = softened.getContext('2d');
+  softContext.filter = 'blur(6px)';
+  softContext.drawImage(base, 0, 0);
+  softContext.filter = 'none';
+
+  return new Promise((resolve, reject) => {
+    softened.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Could not prepare an inpainted frame.')), 'image/webp', 0.96);
+  });
+}
+
+async function decodePatchBlobs(blobs, onProgress) {
+  const bitmaps = [];
+  try {
+    for (let i = 0; i < blobs.length; i++) {
+      bitmaps.push(await createImageBitmap(blobs[i]));
+      if (i % 12 === 0 || i === blobs.length - 1) {
+        onProgress?.(82 + (i / Math.max(1, blobs.length)) * 14, `Preparing repaired frames ${i + 1}/${blobs.length}`);
+      }
+    }
+    return bitmaps;
+  } catch (error) {
+    bitmaps.forEach((bitmap) => bitmap.close?.());
+    throw error;
+  }
+}
+
+/** Process and export a video, returning a local Blob. */
 export async function processVideo({ video, maskImageData, inpaintFn, onProgress, opts = {} }) {
   const width = video.videoWidth;
   const height = video.videoHeight;
   const duration = video.duration;
-  const t0 = performance.now();
+  const startedAt = performance.now();
+  const bounds = findMaskBounds(maskImageData);
+  let patchBitmaps = [];
 
-  // ===== Step 1: AI on first frame =====
-  onProgress?.(2, 'Decoding first frame');
+  onProgress?.(2, 'Reading every source frame');
   video.muted = true;
-  video.currentTime = 0;
-  await new Promise(r => video.addEventListener('seeked', r, { once: true }));
+  const frameTimes = await collectFrameTimes(video, duration);
+  if (!frameTimes.length) throw new Error('No video frames were found.');
 
-  const refCanvas = document.createElement('canvas');
-  refCanvas.width = width;
-  refCanvas.height = height;
-  const refCtx = refCanvas.getContext('2d', { willReadFrequently: true });
-  refCtx.drawImage(video, 0, 0);
-  const firstFrameImageData = refCtx.getImageData(0, 0, width, height);
+  // Limit decoded patch memory to 256 MiB so long clips or large selections
+  // fail clearly instead of exhausting the browser tab.
+  const decodedPatchBytes = bounds.width * bounds.height * 4 * frameTimes.length;
+  if (decodedPatchBytes > 256 * 1024 * 1024) {
+    throw new Error('This clip is too long for the selected area to process safely in this browser. Use a shorter clip or a tighter selection.');
+  }
 
-  onProgress?.(5, 'Running AI on reference frame (one-time)');
-  console.log('[video] Running MI-GAN on first frame');
-  const aiStart = performance.now();
-  const inpaintedFirstFrame = await inpaintFn(firstFrameImageData, maskImageData);
-  console.log(`[video] First-frame AI done in ${((performance.now() - aiStart) / 1000).toFixed(1)}s`);
+  const frameCanvas = document.createElement('canvas');
+  frameCanvas.width = width;
+  frameCanvas.height = height;
+  const frameContext = frameCanvas.getContext('2d', { willReadFrequently: true });
+  const patchBlobs = [];
+  for (let i = 0; i < frameTimes.length; i++) {
+    await seekTo(video, frameTimes[i]);
+    frameContext.drawImage(video, 0, 0, width, height);
+    const frame = frameContext.getImageData(0, 0, width, height);
+    const repaired = await inpaintFn(frame, maskImageData);
+    patchBlobs.push(await makePatchBlob(repaired, maskImageData, bounds));
+    if (i % 2 === 0 || i === frameTimes.length - 1) {
+      onProgress?.(5 + (i / Math.max(1, frameTimes.length)) * 76, `Removing watermark frame by frame · ${i + 1}/${frameTimes.length}`);
+    }
+  }
+  patchBitmaps = await decodePatchBlobs(patchBlobs, onProgress);
+  video.pause();
+  await seekTo(video, 0);
 
-  // ===== Step 2: Build patch =====
-  onProgress?.(12, 'Preparing patch');
-  const patchCanvas = buildPatchCanvas(inpaintedFirstFrame, maskImageData, 6);
-
-  // ===== Step 3: Set up output canvas + recording =====
   const outCanvas = document.createElement('canvas');
   outCanvas.width = width;
   outCanvas.height = height;
-  const outCtx = outCanvas.getContext('2d');
-
-  // Capture on canvas changes so 24/25/30/60fps sources are not all forced
-  // through a fixed 30fps sampler (which can duplicate or drop frames).
+  const outContext = outCanvas.getContext('2d');
   const canvasStream = outCanvas.captureStream();
   const videoTrack = canvasStream.getVideoTracks()[0];
-  if (!videoTrack) throw new Error('captureStream returned no video track');
+  if (!videoTrack) throw new Error('This browser could not capture the edited video.');
 
-  // Audio: use native media-element capture where available. Safari/WebKit
-  // does not currently implement it, so route the decoded audio through a
-  // Web Audio MediaStreamDestination instead.
   let audioTrack = null;
   if (opts.includeAudio !== false) {
     try {
       video.muted = false;
-      const srcStream = video.captureStream ? video.captureStream() : video.mozCaptureStream?.();
-      if (srcStream) {
-        const at = srcStream.getAudioTracks()[0];
-        if (at) audioTrack = at;
-      }
-    } catch (e) {
-      console.warn('[video] Could not capture audio:', e);
+      const sourceStream = video.captureStream ? video.captureStream() : video.mozCaptureStream?.();
+      audioTrack = sourceStream?.getAudioTracks()[0] || null;
+    } catch (error) {
+      console.warn('[video] Native audio capture unavailable:', error);
     }
     if (!audioTrack && opts.audioContext) {
       try {
         const audioSource = opts.audioContext.createMediaElementSource(video);
-        const audioDestination = opts.audioContext.createMediaStreamDestination();
-        audioSource.connect(audioDestination);
-        audioTrack = audioDestination.stream.getAudioTracks()[0] || null;
-      } catch (e) {
-        console.warn('[video] Web Audio fallback could not capture audio:', e);
+        const destination = opts.audioContext.createMediaStreamDestination();
+        audioSource.connect(destination);
+        audioTrack = destination.stream.getAudioTracks()[0] || null;
+      } catch (error) {
+        console.warn('[video] Web Audio capture unavailable:', error);
       }
     }
   }
 
-  const mediaStream = new MediaStream();
-  mediaStream.addTrack(videoTrack);
-  if (audioTrack) mediaStream.addTrack(audioTrack);
-
+  const outputStream = new MediaStream([videoTrack, ...(audioTrack ? [audioTrack] : [])]);
   const candidates = [
     'video/mp4;codecs=avc1,mp4a.40.2',
     'video/webm;codecs=vp9,opus',
     'video/webm;codecs=vp8,opus',
     'video/webm',
   ];
-  const mimeType = opts.mimeType || candidates.find(m => MediaRecorder.isTypeSupported(m));
-  if (!mimeType) throw new Error('No supported MediaRecorder mime type');
-
-  const recorder = new MediaRecorder(mediaStream, { mimeType, videoBitsPerSecond: 5_000_000 });
+  const mimeType = opts.mimeType || candidates.find((type) => MediaRecorder.isTypeSupported(type));
+  if (!mimeType) throw new Error('No supported video export format was found.');
+  const recorder = new MediaRecorder(outputStream, { mimeType, videoBitsPerSecond: 5_000_000 });
   const chunks = [];
-  recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-  const recordingDone = new Promise(r => { recorder.onstop = r; });
+  recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+  const stopped = new Promise((resolve) => { recorder.onstop = resolve; });
 
-  // ===== Step 4: Play video and capture =====
-  onProgress?.(15, 'Recording — playing through video');
-  video.currentTime = 0;
-  // Keep the element unmuted while recording so its captured audio remains
-  // audible in the MediaStream. (This is also the audio the user hears.)
-  video.muted = opts.includeAudio === false;
-
-  // Draw first frame BEFORE starting recorder so it's not blank
-  await new Promise(r => video.addEventListener('seeked', r, { once: true }));
-  outCtx.drawImage(video, 0, 0, width, height);
-  outCtx.drawImage(patchCanvas, 0, 0);
-
+  const drawFrame = (index) => {
+    outContext.drawImage(video, 0, 0, width, height);
+    const bitmap = patchBitmaps[index];
+    if (bitmap) outContext.drawImage(bitmap, bounds.x, bounds.y);
+  };
+  drawFrame(0);
   recorder.start();
+  onProgress?.(96, 'Exporting repaired video with original audio');
 
-  // Use requestVideoFrameCallback when available — gives us frame-accurate timing.
-  const useVFC = typeof video.requestVideoFrameCallback === 'function';
-
-  await new Promise((resolve, reject) => {
-    let frameCount = 0;
-    let lastReportedPct = 15;
-    const playStart = performance.now();
-
-    function onFrame() {
-      outCtx.drawImage(video, 0, 0, width, height);
-      outCtx.drawImage(patchCanvas, 0, 0);
-      frameCount++;
-      const elapsed = (performance.now() - playStart) / 1000;
-      const progress = Math.min(98, 15 + (video.currentTime / duration) * 83);
-      if (progress - lastReportedPct >= 1) {
-        const realtimeFps = frameCount / Math.max(0.1, elapsed);
-        onProgress?.(progress, `Recording ${video.currentTime.toFixed(1)}s / ${duration.toFixed(1)}s · ${realtimeFps.toFixed(0)} fps`);
-        lastReportedPct = progress;
-      }
-      if (useVFC && !video.ended) {
-        video.requestVideoFrameCallback(onFrame);
-      }
-    }
-
-    video.addEventListener('ended', () => resolve(), { once: true });
-    video.addEventListener('error', () => reject(new Error('Video playback error')), { once: true });
-
-    // Safety timeout: 3× video duration max
-    const safetyTimer = setTimeout(() => {
-      console.warn('[video] Safety timeout hit — stopping recording');
-      resolve();
-    }, (duration + 5) * 3 * 1000);
-
-    if (useVFC) {
-      video.requestVideoFrameCallback(onFrame);
-    } else {
-      // Fallback: poll on rAF
-      const tick = () => {
-        if (video.ended || video.currentTime >= duration) { resolve(); return; }
-        onFrame();
-        requestAnimationFrame(tick);
+  const frameIndexAt = (time) => {
+    let index = 0;
+    while (index + 1 < frameTimes.length && frameTimes[index + 1] <= time + 0.0005) index++;
+    return index;
+  };
+  try {
+    await new Promise((resolve, reject) => {
+      let timer;
+      const finish = (error) => {
+        clearTimeout(timer);
+        video.removeEventListener('ended', onEnded);
+        video.removeEventListener('error', onError);
+        error ? reject(error) : resolve();
       };
-      requestAnimationFrame(tick);
-    }
+      const onEnded = () => finish();
+      const onError = () => finish(new Error('Video playback failed during export.'));
+      timer = setTimeout(() => finish(new Error('Video export timed out.')), (duration + 10) * 2000);
+      video.addEventListener('ended', onEnded, { once: true });
+      video.addEventListener('error', onError, { once: true });
 
-    // Start playback
-    video.play().catch((e) => {
-      clearTimeout(safetyTimer);
-      reject(new Error('Could not play video: ' + (e.message || e)));
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        const render = (_now, metadata) => {
+          drawFrame(frameIndexAt(metadata.mediaTime));
+          if (!video.ended) video.requestVideoFrameCallback(render);
+        };
+        video.requestVideoFrameCallback(render);
+      } else {
+        const render = () => {
+          drawFrame(frameIndexAt(video.currentTime));
+          if (!video.ended) requestAnimationFrame(render);
+        };
+        requestAnimationFrame(render);
+      }
+      video.play().catch((error) => finish(new Error(`Could not export video: ${error.message || error}`)));
     });
-  });
+  } finally {
+    if (recorder.state !== 'inactive') recorder.stop();
+    await stopped;
+    video.pause();
+    patchBitmaps.forEach((bitmap) => bitmap.close?.());
+  }
 
-  // ===== Step 5: Finalize =====
-  onProgress?.(99, 'Encoding final frames');
-  recorder.stop();
-  await recordingDone;
-  video.pause();
-
-  const totalSec = ((performance.now() - t0) / 1000).toFixed(1);
-  console.log(`[video] Total time: ${totalSec}s (${duration.toFixed(1)}s video)`);
-  onProgress?.(100, `Done in ${totalSec}s`);
-
+  onProgress?.(100, `Done in ${((performance.now() - startedAt) / 1000).toFixed(1)}s · ${frameTimes.length} frames repaired`);
   return new Blob(chunks, { type: mimeType });
 }
