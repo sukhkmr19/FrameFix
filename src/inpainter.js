@@ -22,6 +22,9 @@
  */
 
 import { loadModel } from './model-cache.js';
+import * as ort from 'onnxruntime-web/webgpu';
+import jsepWasmUrl from '../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url';
+import jsepMjsUrl from '../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url';
 
 // MI-GAN ONNX (verified by `onnx.load` inspection of the actual file):
 //   INPUT:  name='input',  shape=[1, 4, 512, 512], dtype=FLOAT
@@ -83,12 +86,8 @@ export function getPassCount(quality) {
 
 export async function init(onProgress) {
   if (session) return session;
-  if (typeof ort === 'undefined') {
-    throw new Error('ONNX Runtime Web (ort) is not loaded — check your script tag.');
-  }
-
   // Configure ORT before creating session
-  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+  ort.env.wasm.wasmPaths = { wasm: jsepWasmUrl, mjs: jsepMjsUrl };
   ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 4);
   ort.env.wasm.simd = true;
   // proxy=true runs ALL ORT work (model parsing AND inference) in a Web Worker
@@ -194,10 +193,48 @@ export async function inpaint(imageData, maskData, opts = {}) {
   return current;
 }
 
+/** Precompute fixed mask crops once for a sequence of same-sized video frames. */
+export async function createInpaintProcessor(maskData, opts = {}) {
+  if (!session) throw new Error('Inpainter not initialized — call init() first');
+  const preset = QUALITY_PRESETS[opts.quality] ?? QUALITY_PRESETS[DEFAULT_QUALITY];
+  const featherRadius = opts.featherRadius ?? preset.feather;
+  const bbox = findMaskBbox(maskData);
+  if (!bbox) return async (imageData) => imageData;
+
+  const passes = [];
+  for (let i = 0; i < preset.contexts.length; i += 1) {
+    const context = preset.contexts[i];
+    const plan = createPassPlan(maskData.width, maskData.height, bbox, context);
+    plan.cropMask = await cropImageData(maskData, plan.cropX, plan.cropY, plan.cropSize, plan.cropSize);
+    plan.inferMask = await resizeImageData(plan.cropMask, MODEL_SIZE, MODEL_SIZE, 'bilinear');
+    passes.push({ ...plan, context, featherRadius, logRange: i === 0, passLabel: `${i + 1}/${preset.contexts.length}` });
+  }
+
+  return async (imageData) => {
+    if (imageData.width !== maskData.width || imageData.height !== maskData.height) {
+      throw new Error('Video frame dimensions changed during processing');
+    }
+    let current = imageData;
+    for (const plan of passes) current = await runPass(current, maskData, bbox, plan, plan);
+    return current;
+  };
+}
+
+function createPassPlan(width, height, bbox, context) {
+  const maskDim = Math.max(bbox.w, bbox.h);
+  const needed = Math.round(maskDim * context);
+  const cropSize = Math.min(Math.max(MODEL_SIZE, needed), width, height);
+  const centerX = bbox.x + bbox.w / 2;
+  const centerY = bbox.y + bbox.h / 2;
+  const cropX = Math.max(0, Math.min(width - cropSize, Math.round(centerX - cropSize / 2)));
+  const cropY = Math.max(0, Math.min(height - cropSize, Math.round(centerY - cropSize / 2)));
+  return { cropX, cropY, cropSize };
+}
+
 /**
  * One crop → resize → infer → composite cycle.
  */
-async function runPass(imageData, maskData, bbox, { context, featherRadius, logRange, passLabel }) {
+async function runPass(imageData, maskData, bbox, { context, featherRadius, logRange, passLabel }, preparedPlan = null) {
   const { width: W, height: H } = imageData;
 
   // Square crop around the mask.
@@ -218,19 +255,8 @@ async function runPass(imageData, maskData, bbox, { context, featherRadius, logR
   // no information — it just fed the model a blurred crop and softened the
   // result. Fidelity beats a knob that appears to work, so quality now varies
   // the number of refinement passes instead (see QUALITY_PRESETS).
-  const maskDim = Math.max(bbox.w, bbox.h);
-  const needed = Math.round(maskDim * context);
-  const cropSize = Math.min(
-    Math.max(MODEL_SIZE, needed),   // never below native model size…
-    W, H                            // …but never larger than the image
-  );
-
-  const centerX = bbox.x + bbox.w / 2;
-  const centerY = bbox.y + bbox.h / 2;
-  let cropX = Math.round(centerX - cropSize / 2);
-  let cropY = Math.round(centerY - cropSize / 2);
-  cropX = Math.max(0, Math.min(W - cropSize, cropX));
-  cropY = Math.max(0, Math.min(H - cropSize, cropY));
+  const cropPlan = preparedPlan || createPassPlan(W, H, bbox, context);
+  const { cropX, cropY, cropSize } = cropPlan;
 
   console.log(
     `[inpainter] pass ${passLabel} (context ×${context}): mask ${bbox.w}×${bbox.h} at ` +
@@ -238,9 +264,9 @@ async function runPass(imageData, maskData, bbox, { context, featherRadius, logR
   );
 
   const cropImage = await cropImageData(imageData, cropX, cropY, cropSize, cropSize);
-  const cropMask  = await cropImageData(maskData,  cropX, cropY, cropSize, cropSize);
+  const cropMask = cropPlan.cropMask || await cropImageData(maskData, cropX, cropY, cropSize, cropSize);
   const inferImage = await resizeImageData(cropImage, MODEL_SIZE, MODEL_SIZE, 'bilinear');
-  const inferMask  = await resizeImageData(cropMask,  MODEL_SIZE, MODEL_SIZE, 'bilinear');
+  const inferMask = cropPlan.inferMask || await resizeImageData(cropMask, MODEL_SIZE, MODEL_SIZE, 'bilinear');
 
   const inputNames = Array.from(session.inputNames || []);
   if (inputNames.length === 0) {

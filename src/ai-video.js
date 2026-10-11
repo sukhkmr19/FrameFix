@@ -7,7 +7,9 @@ export async function loadVideoMetadata(file) {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
   video.src = url;
-  video.muted = true;
+  // Keep the source's audio track enabled for later capture. Frame scanning
+  // mutes playback temporarily and restores this state before export.
+  video.muted = false;
   video.playsInline = true;
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
@@ -68,18 +70,23 @@ function seekTo(video, time) {
   });
 }
 
-async function collectFrameTimes(video, duration) {
+async function collectFrameTimes(video, duration, onProgress) {
   await seekTo(video, 0);
+  const originalMuted = video.muted;
+  video.muted = true;
   if (typeof video.requestVideoFrameCallback !== 'function') {
     // Legacy-browser fallback. Modern Chrome, Firefox, and Safari use the
     // decoder's actual per-frame media timestamps below.
     const times = [];
-    for (let t = 0; t < duration; t += 1 / 30) times.push(t);
+    for (let t = 0; t < duration; t += 1 / 30) {
+      times.push(t);
+      if (times.length % 30 === 0) onProgress?.(t, times.length);
+    }
+    video.muted = originalMuted;
     return times;
   }
 
   const times = [0];
-  video.muted = true;
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (error) => {
@@ -89,6 +96,7 @@ async function collectFrameTimes(video, duration) {
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('error', onError);
       video.pause();
+      video.muted = originalMuted;
       error ? reject(error) : resolve(times);
     };
     const onEnded = () => finish();
@@ -101,6 +109,7 @@ async function collectFrameTimes(video, duration) {
       const time = metadata.mediaTime;
       if (Number.isFinite(time) && time > times[times.length - 1] + 0.0001 && time < duration) {
         times.push(time);
+        onProgress?.(time, times.length);
       }
       if (!settled && !video.ended) video.requestVideoFrameCallback(readFrame);
     };
@@ -142,13 +151,17 @@ async function makePatchBlob(inpainted, mask, bounds) {
   });
 }
 
-async function decodePatchBlobs(blobs, onProgress) {
+async function decodePatchBlobs(blobs, onProgress, exportDurationMs) {
   const bitmaps = [];
+  const startedAt = performance.now();
   try {
     for (let i = 0; i < blobs.length; i++) {
       bitmaps.push(await createImageBitmap(blobs[i]));
       if (i % 12 === 0 || i === blobs.length - 1) {
-        onProgress?.(82 + (i / Math.max(1, blobs.length)) * 14, `Preparing repaired frames ${i + 1}/${blobs.length}`);
+        const completed = i + 1;
+        const averageMs = (performance.now() - startedAt) / completed;
+        const etaMs = averageMs * (blobs.length - completed) + exportDurationMs;
+        onProgress?.(82 + (i / Math.max(1, blobs.length)) * 14, `Preparing repaired frames ${completed}/${blobs.length}`, { etaMs });
       }
     }
     return bitmaps;
@@ -167,9 +180,13 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
   const bounds = findMaskBounds(maskImageData);
   let patchBitmaps = [];
 
+  const originalMuted = video.muted;
+  const originalVolume = video.volume;
   onProgress?.(2, 'Reading every source frame');
-  video.muted = true;
-  const frameTimes = await collectFrameTimes(video, duration);
+  const frameTimes = await collectFrameTimes(video, duration, (time, count) => {
+    const etaMs = Math.max(0, duration - time) * 1000;
+    onProgress?.(1 + (time / duration) * 4, `Reading source frames · ${count}`, { etaMs });
+  });
   if (!frameTimes.length) throw new Error('No video frames were found.');
 
   // Limit decoded patch memory to 256 MiB so long clips or large selections
@@ -184,6 +201,7 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
   frameCanvas.height = height;
   const frameContext = frameCanvas.getContext('2d', { willReadFrequently: true });
   const patchBlobs = [];
+  const frameProcessingStartedAt = performance.now();
   for (let i = 0; i < frameTimes.length; i++) {
     await seekTo(video, frameTimes[i]);
     frameContext.drawImage(video, 0, 0, width, height);
@@ -191,10 +209,13 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
     const repaired = await inpaintFn(frame, maskImageData);
     patchBlobs.push(await makePatchBlob(repaired, maskImageData, bounds));
     if (i % 2 === 0 || i === frameTimes.length - 1) {
-      onProgress?.(5 + (i / Math.max(1, frameTimes.length)) * 76, `Removing watermark frame by frame · ${i + 1}/${frameTimes.length}`);
+      const completed = i + 1;
+      const averageMs = (performance.now() - frameProcessingStartedAt) / completed;
+      const etaMs = averageMs * (frameTimes.length - completed) + duration * 1000;
+      onProgress?.(5 + (i / Math.max(1, frameTimes.length)) * 76, `Removing watermark frame by frame · ${completed}/${frameTimes.length}`, { etaMs });
     }
   }
-  patchBitmaps = await decodePatchBlobs(patchBlobs, onProgress);
+  patchBitmaps = await decodePatchBlobs(patchBlobs, onProgress, duration * 1000);
   video.pause();
   await seekTo(video, 0);
 
@@ -240,6 +261,7 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
   const chunks = [];
   recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
   const stopped = new Promise((resolve) => { recorder.onstop = resolve; });
+  let lastExportProgressAt = -1;
 
   const drawFrame = (index) => {
     outContext.drawImage(video, 0, 0, width, height);
@@ -247,8 +269,11 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
     if (bitmap) outContext.drawImage(bitmap, bounds.x, bounds.y);
   };
   drawFrame(0);
+  // Zero element volume avoids autoplay blocking after the long AI pass while
+  // captureStream continues to carry the original audio samples.
+  video.volume = 0;
   recorder.start();
-  onProgress?.(96, 'Exporting repaired video with original audio');
+  onProgress?.(96, 'Exporting repaired video with original audio', { etaMs: duration * 1000 });
 
   const frameIndexAt = (time) => {
     let index = 0;
@@ -273,12 +298,20 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
       if (typeof video.requestVideoFrameCallback === 'function') {
         const render = (_now, metadata) => {
           drawFrame(frameIndexAt(metadata.mediaTime));
+          if (metadata.mediaTime - lastExportProgressAt >= 0.25 || metadata.mediaTime >= duration) {
+            lastExportProgressAt = metadata.mediaTime;
+            onProgress?.(96 + (metadata.mediaTime / duration) * 4, 'Exporting repaired video with original audio', { etaMs: Math.max(0, duration - metadata.mediaTime) * 1000 });
+          }
           if (!video.ended) video.requestVideoFrameCallback(render);
         };
         video.requestVideoFrameCallback(render);
       } else {
         const render = () => {
           drawFrame(frameIndexAt(video.currentTime));
+          if (video.currentTime - lastExportProgressAt >= 0.25 || video.currentTime >= duration) {
+            lastExportProgressAt = video.currentTime;
+            onProgress?.(96 + (video.currentTime / duration) * 4, 'Exporting repaired video with original audio', { etaMs: Math.max(0, duration - video.currentTime) * 1000 });
+          }
           if (!video.ended) requestAnimationFrame(render);
         };
         requestAnimationFrame(render);
@@ -289,9 +322,11 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
     if (recorder.state !== 'inactive') recorder.stop();
     await stopped;
     video.pause();
+    video.muted = originalMuted;
+    video.volume = originalVolume;
     patchBitmaps.forEach((bitmap) => bitmap.close?.());
   }
 
-  onProgress?.(100, `Done in ${((performance.now() - startedAt) / 1000).toFixed(1)}s · ${frameTimes.length} frames repaired`);
+  onProgress?.(100, `Done in ${((performance.now() - startedAt) / 1000).toFixed(1)}s · ${frameTimes.length} frames repaired`, { etaMs: 0 });
   return new Blob(chunks, { type: mimeType });
 }

@@ -22,7 +22,7 @@
       </section>
       <section>
         <h2>2. How processing works</h2>
-        <p>Image and video processing happens locally in your browser. FrameFix does not receive or store your files. Your browser downloads the ONNX Runtime library and an AI model from third-party hosts; the model is cached in your browser for later use. Those providers may process ordinary network request information under their own terms.</p>
+        <p>Image and video processing happens locally in your browser. FrameFix does not upload your media to a remote service. The ONNX Runtime code and WebAssembly files are bundled with this site. Your browser downloads the AI model from its configured public host; that host may receive ordinary network request information but does not receive your media from FrameFix. If you run the optional local proof utility, the finished export is transferred only to a helper listening on this same computer (127.0.0.1). It hashes the export in memory and signs a separate proof; it does not store or forward the media. The proof uses the local computer clock and does not independently attest that AI processing occurred or establish original authorship. The image or video pixels are not changed to embed the proof. The utility is provided in the public repository for users who want to inspect or run it.</p>
       </section>
       <section>
         <h2>3. Results and limitations</h2>

@@ -1,0 +1,8 @@
+node_modules/
+keys/
+*.framefix-proof.json
+*.framefix-report.pdf
+*.pem
+*.key
+*.p12
+*.pfx

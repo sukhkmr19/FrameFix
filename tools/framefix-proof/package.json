@@ -1,0 +1,12 @@
+{
+  "name": "framefix-private-verifier",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Private on-device FrameFix signer and offline verifier with PDF reports",
+  "scripts": {
+    "keys": "node src/framefix-proof.mjs keys",
+    "signer": "node src/local-signer.mjs",
+    "verify": "node src/framefix-proof.mjs verify"
+  }
+}

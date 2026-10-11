@@ -1,5 +1,6 @@
-import { init as initInpainter, inpaint, getBackend } from './inpainter.js';
+import { init as initInpainter, inpaint, createInpaintProcessor, getBackend } from './inpainter.js';
 import { processVideo as recordInpaintedVideo } from './ai-video.js';
+import { createFrameFixProof, checkLocalSigner, clearSignerToken, getSignerToken, setSignerToken } from './provenance.js';
 import './style.css';
 
 const $ = (selector) => document.querySelector(selector);
@@ -9,8 +10,10 @@ const resultVideo = $('#result-video');
 const resultImage = $('#result-image');
 const stage = $('#video-stage');
 const selection = $('#selection');
+const selectionSurface = $('#selection-surface');
 const fileInput = $('#file-input');
 const processButton = $('#process-button');
+const drawSelectionButton = $('#draw-selection-button');
 const MAX_SIZE = 200 * 1024 * 1024;
 const MAX_DURATION = 180;
 const MAX_SELECTION_AREA = 0.12;
@@ -20,7 +23,11 @@ let currentFile = null;
 let mediaMode = 'video';
 let sourceURL = null;
 let outputURL = null;
-let rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+let proofURL = null;
+let rect = { x: 0, y: 0, w: 0, h: 0 };
+let hasSelection = false;
+let drawingSelection = false;
+let drawStart = null;
 let drag = null;
 let processing = false;
 let toastTimer;
@@ -44,11 +51,23 @@ function paintSelection() {
   updateButton();
 }
 
-function setProgress(value, label) {
+function formatEta(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return '';
+  const seconds = Math.max(1, Math.ceil(milliseconds / 1000));
+  if (seconds < 60) return `About ${seconds}s remaining`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `About ${minutes}m ${remainder}s remaining` : `About ${minutes}m remaining`;
+}
+
+function setProgress(value, label, details) {
   const percent = Math.max(0, Math.min(100, Math.round(value)));
   $('#progress-fill').style.width = `${percent}%`;
   $('#progress-value').textContent = `${percent}%`;
   if (label) $('#progress-label').textContent = label;
+  const eta = $('#progress-eta');
+  eta.textContent = formatEta(details?.etaMs);
+  eta.hidden = !eta.textContent;
 }
 
 function updateButton() {
@@ -59,9 +78,87 @@ function updateButton() {
     warning.textContent = `This selection covers ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% of the frame. Large masks can invent objects. Resize the box tightly around the logo to continue.`;
   }
   const mediaReady = mediaMode === 'image' ? sourceImage.naturalWidth > 0 : video.videoWidth > 0;
-  const ready = currentFile && mediaReady && $('#authorization-check').checked && !processing && !selectionTooLarge;
+  const ready = currentFile && mediaReady && hasSelection && $('#authorization-check').checked && !processing && !selectionTooLarge && !drawingSelection;
+  drawSelectionButton.disabled = !currentFile || !mediaReady || processing;
+  drawSelectionButton.textContent = drawingSelection ? 'Cancel area selection' : hasSelection ? 'Redraw selected area' : 'Select area on preview';
+  drawSelectionButton.setAttribute('aria-pressed', String(drawingSelection));
+  $('#selection-state').textContent = drawingSelection ? 'Drag over the mark' : hasSelection ? 'Area selected' : 'No area selected';
+  $('#selection-dot').classList.toggle('is-selected', hasSelection && !drawingSelection);
+  $('#area-instruction').textContent = drawingSelection
+    ? 'Drag over the mark in your preview.'
+    : hasSelection
+      ? mediaMode === 'image' ? 'Drag the box to move it, or resize a corner.' : 'Keep the mark inside this box throughout the clip.'
+      : currentFile ? 'Select the mark in your preview.' : 'Choose a file to get started.';
+  $('#area-width').innerHTML = hasSelection ? `${Math.round(rect.w * 100)}%<small> width</small>` : '—<small> width</small>';
+  $('#area-height').innerHTML = hasSelection ? `${Math.round(rect.h * 100)}%<small> height</small>` : '—<small> height</small>';
   processButton.disabled = !ready;
-  $('#process-label').textContent = processing ? 'Processing…' : selectionTooLarge && currentFile ? 'Resize around the logo' : ready ? 'Remove watermark' : currentFile ? 'Loading preview…' : mediaMode === 'image' ? 'Choose an image' : 'Choose a video';
+  $('#process-label').textContent = processing ? 'Processing…' : selectionTooLarge && currentFile ? 'Make the area smaller' : !currentFile ? mediaMode === 'image' ? 'Choose an image' : 'Choose a video' : !mediaReady ? 'Loading preview…' : !hasSelection ? 'Select an area first' : !$('#authorization-check').checked ? 'Confirm editing permission' : ready ? 'Remove selected area' : 'Ready when you are';
+}
+
+function clearProof() {
+  if (proofURL) URL.revokeObjectURL(proofURL);
+  proofURL = null;
+  $('#proof-download').hidden = true;
+  $('#provenance-status').textContent = '';
+  $('#provenance-status').hidden = true;
+}
+
+async function prepareProof(blob, fileName, mediaType) {
+  clearProof();
+  $('#provenance-status').hidden = false;
+  $('#provenance-status').textContent = 'Signing export on this computer…';
+  try {
+    const proof = await createFrameFixProof(blob, fileName, mediaType);
+    const proofBlob = new Blob([`${JSON.stringify(proof, null, 2)}\n`], { type: 'application/json' });
+    proofURL = URL.createObjectURL(proofBlob);
+    $('#proof-download').href = proofURL;
+    $('#proof-download').download = `${fileName}.framefix-proof.json`;
+    $('#proof-download').hidden = false;
+    $('#provenance-status').textContent = `Signed on this device · ${new Date(proof.signedAt).toLocaleString()} · separate proof file`;
+    return true;
+  } catch (error) {
+    console.warn('[provenance] Could not create signed export proof:', error);
+    $('#provenance-status').textContent = `Signed proof unavailable: ${error.message}`;
+    return false;
+  }
+}
+
+async function connectLocalSigner(token = $('#signer-token').value) {
+  const button = $('#connect-signer');
+  const status = $('#signer-connection-status');
+  button.disabled = true;
+  status.textContent = 'Connecting to the private signer on this device…';
+  try {
+    setSignerToken(token);
+    const service = await checkLocalSigner();
+    status.textContent = `Connected · key ${service.keyId}`;
+    $('#signer-token').value = '';
+    $('#signer-token').placeholder = 'Connected for this browser tab';
+    showToast('Private local signer connected. Exports will be signed on this device.');
+  } catch (error) {
+    clearSignerToken();
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$('#connect-signer').addEventListener('click', () => connectLocalSigner());
+$('#signer-token').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') connectLocalSigner();
+});
+$('#disconnect-signer').addEventListener('click', () => {
+  clearSignerToken();
+  $('#signer-connection-status').textContent = 'Disconnected. Your private signing key remains on this device.';
+  $('#signer-token').placeholder = 'Paste the one-session pairing code';
+});
+if (getSignerToken()) {
+  checkLocalSigner().then((service) => {
+    $('#signer-connection-status').textContent = `Connected · key ${service.keyId}`;
+  }).catch((error) => {
+    $('#signer-connection-status').textContent = error.message;
+    clearSignerToken();
+  });
 }
 
 function loadVideo(file) {
@@ -70,6 +167,9 @@ function loadVideo(file) {
   if (!knownVideo) return showToast('This video format is not supported. Try MP4, MOV, or WebM.');
   if (file.size > MAX_SIZE) return showToast('The file must be under 200 MB. Export a smaller copy and try again.');
   currentFile = file;
+  hasSelection = false;
+  drawingSelection = false;
+  clearProof();
   sourceImage.onload = null;
   sourceImage.onerror = null;
   $('#output-format').textContent = 'MP4 video + audio';
@@ -78,6 +178,8 @@ function loadVideo(file) {
   resultImage.hidden = true;
   video.hidden = false;
   $('#result-preview').hidden = true;
+  $('#dropzone').hidden = true;
+  $('#replace-button').textContent = 'Replace video';
   resultVideo.pause();
   resultVideo.removeAttribute('src');
   resultVideo.load();
@@ -92,7 +194,9 @@ function loadVideo(file) {
   selection.hidden = false;
   $('#replace-button').hidden = false;
   $('#video-facts').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB`;
-  rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+  rect = { x: 0, y: 0, w: 0, h: 0 };
+  selection.hidden = true;
+  selectionSurface.hidden = true;
   paintSelection();
   updateButton();
 }
@@ -103,6 +207,9 @@ function loadImage(file) {
   if (!supportedImage) return showToast('Choose a JPG, PNG, or WebP image.');
   if (file.size > MAX_SIZE) return showToast('The image must be under 200 MB.');
   currentFile = file;
+  hasSelection = false;
+  drawingSelection = false;
+  clearProof();
   $('#output-format').textContent = 'PNG image';
   $('#download-button').hidden = true;
   sourceImage.onload = null;
@@ -119,6 +226,8 @@ function loadImage(file) {
   resultVideo.hidden = true;
   resultImage.hidden = true;
   $('#result-preview').hidden = true;
+  $('#dropzone').hidden = true;
+  $('#replace-button').textContent = 'Replace image';
   if (outputURL) { URL.revokeObjectURL(outputURL); outputURL = null; }
   if (sourceURL) URL.revokeObjectURL(sourceURL);
   sourceURL = URL.createObjectURL(file);
@@ -137,10 +246,11 @@ function loadImage(file) {
     }
     stage.classList.remove('is-empty');
     $('#empty-preview').hidden = true;
-    selection.hidden = false;
+    selection.hidden = true;
+    selectionSurface.hidden = true;
     $('#replace-button').hidden = false;
     $('#video-facts').textContent = `${file.name} · ${sourceImage.naturalWidth} × ${sourceImage.naturalHeight}`;
-    rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+    rect = { x: 0, y: 0, w: 0, h: 0 };
     paintSelection();
     updateButton();
   };
@@ -153,6 +263,9 @@ function setMode(nextMode) {
   if (mediaMode === nextMode) return;
   mediaMode = nextMode;
   currentFile = null;
+  hasSelection = false;
+  drawingSelection = false;
+  clearProof();
   video.pause();
   video.removeAttribute('src');
   video.load();
@@ -169,11 +282,13 @@ function setMode(nextMode) {
   resultImage.hidden = true;
   $('#result-preview').hidden = true;
   $('#download-button').hidden = true;
+  $('#dropzone').hidden = false;
   if (sourceURL) { URL.revokeObjectURL(sourceURL); sourceURL = null; }
   if (outputURL) { URL.revokeObjectURL(outputURL); outputURL = null; }
   stage.classList.add('is-empty');
   $('#empty-preview').hidden = false;
   selection.hidden = true;
+  selectionSurface.hidden = true;
   $('#replace-button').hidden = true;
   $('#video-facts').textContent = nextMode === 'image' ? 'No image selected' : 'No video selected';
   $('#video-mode').classList.toggle('active', nextMode === 'video');
@@ -185,13 +300,17 @@ function setMode(nextMode) {
   $('#drop-title').textContent = nextMode === 'image' ? 'Drop your image here' : 'Drop your video here';
   $('#output-format').textContent = nextMode === 'image' ? 'PNG image' : 'MP4 video + audio';
   $('#tip-copy').textContent = nextMode === 'image'
-    ? 'Cover the complete mark with a little margin. The AI reconstructs only the selected area.'
-    : 'Keep the watermark inside the selected box for the whole clip. Each frame is repaired separately, so moving backgrounds are not covered by a frozen patch.';
+    ? 'Draw a tight box around the whole mark with a little margin.'
+    : 'Keep the mark inside the box for the whole clip. Each frame is repaired separately.';
   $('#honesty-copy').textContent = nextMode === 'image'
     ? 'AI estimates the missing pixels in the selected area; it cannot recover the original hidden image data. Your image stays in this browser.'
     : 'Every frame runs through AI separately, so processing takes longer and results may vary slightly between frames. The selected box stays at the same screen position. The model is cached on your device.';
   fileInput.accept = nextMode === 'image' ? 'image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp' : 'video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm';
-  rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+  rect = { x: 0, y: 0, w: 0, h: 0 };
+  hasSelection = false;
+  drawingSelection = false;
+  selection.hidden = true;
+  selectionSurface.hidden = true;
   paintSelection();
   updateButton();
 }
@@ -251,6 +370,19 @@ dropzone.addEventListener('drop', (event) => {
 });
 
 $('#authorization-check').addEventListener('change', updateButton);
+drawSelectionButton.addEventListener('click', () => {
+  if (!currentFile || processing) return;
+  if (drawingSelection) {
+    drawingSelection = false;
+    selectionSurface.hidden = true;
+    selection.hidden = !hasSelection;
+  } else {
+    drawingSelection = true;
+    selection.hidden = true;
+    selectionSurface.hidden = false;
+  }
+  updateButton();
+});
 
 function pointerPoint(event) {
   const bounds = stage.getBoundingClientRect();
@@ -305,8 +437,42 @@ selection.addEventListener('pointermove', (event) => {
 selection.addEventListener('pointerup', () => { drag = null; });
 selection.addEventListener('pointercancel', () => { drag = null; });
 
+selectionSurface.addEventListener('pointerdown', (event) => {
+  if (!drawingSelection || event.button !== 0) return;
+  event.preventDefault();
+  selectionSurface.setPointerCapture(event.pointerId);
+  drawStart = pointerPoint(event);
+  hasSelection = false;
+  rect = { x: drawStart.x, y: drawStart.y, w: 0, h: 0 };
+  selection.hidden = false;
+  paintSelection();
+});
+selectionSurface.addEventListener('pointermove', (event) => {
+  if (!drawStart) return;
+  const point = pointerPoint(event);
+  rect = {
+    x: Math.min(drawStart.x, point.x),
+    y: Math.min(drawStart.y, point.y),
+    w: Math.abs(point.x - drawStart.x),
+    h: Math.abs(point.y - drawStart.y),
+  };
+  paintSelection();
+});
+function finishAreaSelection() {
+  if (!drawStart) return;
+  drawStart = null;
+  hasSelection = rect.w >= 0.015 && rect.h >= 0.015;
+  drawingSelection = false;
+  selectionSurface.hidden = true;
+  selection.hidden = !hasSelection;
+  if (!hasSelection) showToast('Drag farther to draw the selected area.');
+  updateButton();
+}
+selectionSurface.addEventListener('pointerup', finishAreaSelection);
+selectionSurface.addEventListener('pointercancel', finishAreaSelection);
+
 async function processVideo() {
-  if (!currentFile || !video.videoWidth || !$('#authorization-check').checked || processing) return;
+  if (!currentFile || !video.videoWidth || !hasSelection || !$('#authorization-check').checked || processing) return;
   processing = true;
   updateButton();
   $('#download-button').hidden = true;
@@ -339,11 +505,13 @@ async function processVideo() {
     if (!preferredMime) throw new Error('Video export is not supported in this browser. Try Chrome or Edge.');
     $('#output-format').textContent = preferredMime.includes('mp4') ? 'MP4 video + audio' : 'WebM video + audio';
     const ext = preferredMime.includes('mp4') ? 'mp4' : 'webm';
+    setProgress(29, 'Preparing mask for repeated frame processing…');
+    const inpaintFrame = await createInpaintProcessor(mask, { quality: 'standard' });
     const blob = await recordInpaintedVideo({
       video,
       maskImageData: mask,
-      inpaintFn: (frame) => inpaint(frame, mask, { quality: 'standard' }),
-      onProgress: (pct, label) => setProgress(30 + pct * 0.7, label),
+      inpaintFn: inpaintFrame,
+      onProgress: (pct, label, details) => setProgress(30 + pct * 0.7, label, details),
       opts: { includeAudio: true, mimeType: preferredMime, audioContext },
     });
     if (outputURL) URL.revokeObjectURL(outputURL);
@@ -354,8 +522,10 @@ async function processVideo() {
     resultVideo.load();
     $('#result-preview').hidden = false;
     $('#download-button').href = outputURL;
-    $('#download-button').download = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.${ext}`;
-    $('#download-button').textContent = 'Download edited video ↓';
+    const outputName = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.${ext}`;
+    $('#download-button').download = outputName;
+    await prepareProof(blob, outputName, preferredMime.split(';')[0]);
+    $('#download-button').textContent = proofURL ? 'Download edited video + proof ↓' : 'Download edited video ↓';
     $('#download-button').hidden = false;
     setProgress(100, `AI complete · ${getBackend().toUpperCase()} · video ready`);
     showToast('AI processing is complete. Review the preview before downloading.');
@@ -374,7 +544,7 @@ async function processVideo() {
 }
 
 async function processImage() {
-  if (!currentFile || !sourceImage.naturalWidth || !$('#authorization-check').checked || processing) return;
+  if (!currentFile || !sourceImage.naturalWidth || !hasSelection || !$('#authorization-check').checked || processing) return;
   processing = true;
   updateButton();
   $('#download-button').hidden = true;
@@ -413,8 +583,10 @@ async function processImage() {
     resultImage.hidden = false;
     $('#result-preview').hidden = false;
     $('#download-button').href = outputURL;
-    $('#download-button').download = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.png`;
-    $('#download-button').textContent = 'Download edited image ↓';
+    const outputName = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.png`;
+    $('#download-button').download = outputName;
+    await prepareProof(blob, outputName, 'image/png');
+    $('#download-button').textContent = proofURL ? 'Download edited image + proof ↓' : 'Download edited image ↓';
     $('#download-button').hidden = false;
     setProgress(100, 'AI image ready');
     showToast('Image edit is complete. Review it before downloading.');
@@ -429,10 +601,16 @@ async function processImage() {
 }
 
 processButton.addEventListener('click', () => mediaMode === 'image' ? processImage() : processVideo());
+$('#download-button').addEventListener('click', () => {
+  if (!proofURL) return;
+  // Keep the media as the primary download and automatically include its proof sidecar.
+  window.setTimeout(() => $('#proof-download').click(), 120);
+});
 window.addEventListener('resize', paintSelection);
 window.addEventListener('beforeunload', () => {
   if (sourceURL) URL.revokeObjectURL(sourceURL);
   if (outputURL) URL.revokeObjectURL(outputURL);
+  if (proofURL) URL.revokeObjectURL(proofURL);
   resultVideo.pause();
 });
 
