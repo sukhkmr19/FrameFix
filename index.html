@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f5f1" />
+    <link rel="icon" type="image/png" href="/framefix-icon.png" />
+    <meta name="description" content="Select a watermark on a video you own or are authorized to edit. Reconstruct the area with browser-based AI inpainting." />
+    <title>FrameFix — browser-based AI video inpainting</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="FrameFix home"><img class="brand-mark-image" src="/framefix-icon.png" alt="" /><span>FrameFix<span class="brand-dot">.</span></span></a>
+        <span class="privacy-pill"><span class="privacy-dot"></span> Private by design</span>
+      </header>
+
+      <main>
+        <section class="intro">
+          <p class="eyebrow">IN YOUR BROWSER. ON YOUR DEVICE.</p>
+          <h1>Restore a clean<br /><span>video frame.</span></h1>
+          <p class="intro-copy">Select a small watermark area. Browser-based AI reconstructs it on the first frame and applies that patch to the clip. Your video is not uploaded.</p>
+        </section>
+
+        <section class="workspace" aria-label="Video editor">
+          <div class="editor-column">
+            <div class="section-heading"><span class="step-number">01</span><div><h2>Choose a video</h2><p>MP4, MOV, or WebM · Up to 200 MB and 3 minutes</p></div></div>
+            <label class="dropzone" id="dropzone" for="file-input">
+              <input id="file-input" type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" />
+              <span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg></span>
+              <span class="drop-title">Drop your video here</span>
+              <span class="drop-subtitle">or <span>choose a file</span></span>
+              <span class="drop-meta">Your file stays in this browser tab</span>
+            </label>
+
+            <div class="video-stage is-empty" id="video-stage">
+              <video id="source-video" controls playsinline aria-label="Uploaded video preview"></video>
+              <div class="empty-preview" id="empty-preview"><div class="film-icon">▧</div><span>Your preview will appear here</span></div>
+              <div class="selection" id="selection" role="group" aria-label="Selected area" hidden>
+                <span class="selection-label">EDIT AREA</span>
+                <span class="resize-handle nw" data-handle="nw"></span><span class="resize-handle ne" data-handle="ne"></span>
+                <span class="resize-handle sw" data-handle="sw"></span><span class="resize-handle se" data-handle="se"></span>
+              </div>
+            </div>
+            <div class="result-preview" id="result-preview" hidden><div class="result-label">AI RESULT · REVIEW BEFORE DOWNLOADING</div><video id="result-video" controls playsinline aria-label="AI inpainted result preview"></video></div>
+            <div class="preview-footer"><span id="video-facts">No video selected</span><button class="text-button" id="replace-button" type="button" hidden>Replace video</button></div>
+            <div class="tip-line"><span class="tip-star">✳</span><span><strong>Tip:</strong> Cover the whole mark and leave a little margin. This method works best with a stationary watermark over a mostly static background.</span></div>
+
+            <div class="section-heading edit-heading"><span class="step-number">02</span><div><h2>Select the watermark</h2><p>Drag and resize the box to cover the mark.</p></div></div>
+          </div>
+
+          <aside class="settings-panel">
+            <div class="panel-top"><span class="step-number">03</span><div><h2>AI removal</h2><p>The model runs on your device</p></div></div>
+            <div class="selection-readout"><div class="readout-top"><span class="readout-icon">⌗</span><strong>Selected area</strong><span class="live-dot"></span></div><div class="readout-values"><span id="area-width">—<small> width</small></span><span class="readout-cross">×</span><span id="area-height">—<small> height</small></span></div><div class="readout-foot" id="area-instruction">Choose a video to select an area</div></div>
+            <div class="export-info"><div class="info-line"><span>Processing</span><strong><span class="local-icon">⌂</span> In your browser</strong></div><div class="info-line"><span>First use</span><strong>AI model · ~29 MB</strong></div><div class="info-line"><span>Output</span><strong id="output-format">WebM video + audio</strong></div></div>
+            <label class="auth-check"><input id="authorization-check" type="checkbox" /><span>I own this video or have permission to edit it. I will not use this tool to bypass paid platform branding or DRM.</span></label>
+            <button class="process-button" id="process-button" type="button" disabled><span id="process-label">Choose a video</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
+            <div class="progress-wrap" id="progress-wrap" hidden><div class="progress-copy"><span id="progress-label">Preparing AI…</span><span id="progress-value">0%</span></div><div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div></div>
+            <a class="download-button" id="download-button" hidden download="framefix-edited.webm">Download edited video <span>↓</span></a>
+            <div class="honesty-note"><span class="note-icon">i</span><p>This one-patch method can look blurry or ghosted if the watermark or the scene behind it moves. It works best for static marks. The browser downloads the ~29 MB model once and then caches it on your device.</p></div>
+          </aside>
+        </section>
+        <p class="footer-note">No account. No video upload. No app server. <span>♥</span> Your video stays under your control.<br /><a href="./terms.html">Terms of Use</a> · <a href="https://myndrix.space/" target="_blank" rel="noopener noreferrer">myndrix.space</a> · Built by <a href="https://sukhbeer.im/" target="_blank" rel="noopener noreferrer">Sukhbeer Kumar</a></p>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

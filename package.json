@@ -1,0 +1,16 @@
+{
+  "name": "framefix",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "vite": "8.3.4"
+  },
+  "license": "GPL-2.0-or-later"
+}
