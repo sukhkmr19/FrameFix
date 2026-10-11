@@ -4,7 +4,9 @@ import './style.css';
 
 const $ = (selector) => document.querySelector(selector);
 const video = $('#source-video');
+const sourceImage = $('#source-image');
 const resultVideo = $('#result-video');
+const resultImage = $('#result-image');
 const stage = $('#video-stage');
 const selection = $('#selection');
 const fileInput = $('#file-input');
@@ -15,6 +17,7 @@ const MAX_SELECTION_AREA = 0.12;
 const MAX_SELECTION_DIMENSION = 0.4;
 
 let currentFile = null;
+let mediaMode = 'video';
 let sourceURL = null;
 let outputURL = null;
 let rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
@@ -55,9 +58,10 @@ function updateButton() {
   if (currentFile && selectionTooLarge) {
     warning.textContent = `This selection covers ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% of the frame. Large masks can invent objects. Resize the box tightly around the logo to continue.`;
   }
-  const ready = currentFile && video.videoWidth > 0 && $('#authorization-check').checked && !processing && !selectionTooLarge;
+  const mediaReady = mediaMode === 'image' ? sourceImage.naturalWidth > 0 : video.videoWidth > 0;
+  const ready = currentFile && mediaReady && $('#authorization-check').checked && !processing && !selectionTooLarge;
   processButton.disabled = !ready;
-  $('#process-label').textContent = processing ? 'Processing…' : selectionTooLarge && currentFile ? 'Resize around the logo' : ready ? 'Remove watermark' : currentFile ? 'Loading preview…' : 'Choose a video';
+  $('#process-label').textContent = processing ? 'Processing…' : selectionTooLarge && currentFile ? 'Resize around the logo' : ready ? 'Remove watermark' : currentFile ? 'Loading preview…' : mediaMode === 'image' ? 'Choose an image' : 'Choose a video';
 }
 
 function loadVideo(file) {
@@ -66,6 +70,13 @@ function loadVideo(file) {
   if (!knownVideo) return showToast('This video format is not supported. Try MP4, MOV, or WebM.');
   if (file.size > MAX_SIZE) return showToast('The file must be under 200 MB. Export a smaller copy and try again.');
   currentFile = file;
+  sourceImage.onload = null;
+  sourceImage.onerror = null;
+  $('#output-format').textContent = 'MP4 video + audio';
+  $('#download-button').hidden = true;
+  sourceImage.hidden = true;
+  resultImage.hidden = true;
+  video.hidden = false;
   $('#result-preview').hidden = true;
   resultVideo.pause();
   resultVideo.removeAttribute('src');
@@ -86,7 +97,107 @@ function loadVideo(file) {
   updateButton();
 }
 
+function loadImage(file) {
+  if (!file) return;
+  const supportedImage = ['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || /\.(jpe?g|png|webp)$/i.test(file.name);
+  if (!supportedImage) return showToast('Choose a JPG, PNG, or WebP image.');
+  if (file.size > MAX_SIZE) return showToast('The image must be under 200 MB.');
+  currentFile = file;
+  $('#output-format').textContent = 'PNG image';
+  $('#download-button').hidden = true;
+  sourceImage.onload = null;
+  sourceImage.onerror = null;
+  sourceImage.removeAttribute('src');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  video.hidden = true;
+  sourceImage.hidden = false;
+  resultVideo.pause();
+  resultVideo.removeAttribute('src');
+  resultVideo.load();
+  resultVideo.hidden = true;
+  resultImage.hidden = true;
+  $('#result-preview').hidden = true;
+  if (outputURL) { URL.revokeObjectURL(outputURL); outputURL = null; }
+  if (sourceURL) URL.revokeObjectURL(sourceURL);
+  sourceURL = URL.createObjectURL(file);
+  sourceImage.src = sourceURL;
+  sourceImage.onload = () => {
+    if (sourceImage.naturalWidth * sourceImage.naturalHeight > 16000000) {
+      sourceImage.onload = null;
+      currentFile = null;
+      sourceImage.removeAttribute('src');
+      sourceImage.hidden = true;
+      stage.classList.add('is-empty');
+      $('#empty-preview').hidden = false;
+      selection.hidden = true;
+      updateButton();
+      return showToast('This image is too large for browser editing. Resize it below 16 megapixels and try again.');
+    }
+    stage.classList.remove('is-empty');
+    $('#empty-preview').hidden = true;
+    selection.hidden = false;
+    $('#replace-button').hidden = false;
+    $('#video-facts').textContent = `${file.name} · ${sourceImage.naturalWidth} × ${sourceImage.naturalHeight}`;
+    rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+    paintSelection();
+    updateButton();
+  };
+  sourceImage.onerror = () => showToast('Could not open this image. Try JPG, PNG, or WebP.');
+  fileInput.value = '';
+  updateButton();
+}
+
+function setMode(nextMode) {
+  if (mediaMode === nextMode) return;
+  mediaMode = nextMode;
+  currentFile = null;
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  sourceImage.removeAttribute('src');
+  sourceImage.onload = null;
+  sourceImage.onerror = null;
+  sourceImage.hidden = true;
+  video.hidden = nextMode === 'image';
+  resultVideo.pause();
+  resultVideo.removeAttribute('src');
+  resultVideo.load();
+  resultVideo.hidden = nextMode === 'image';
+  resultImage.removeAttribute('src');
+  resultImage.hidden = true;
+  $('#result-preview').hidden = true;
+  $('#download-button').hidden = true;
+  if (sourceURL) { URL.revokeObjectURL(sourceURL); sourceURL = null; }
+  if (outputURL) { URL.revokeObjectURL(outputURL); outputURL = null; }
+  stage.classList.add('is-empty');
+  $('#empty-preview').hidden = false;
+  selection.hidden = true;
+  $('#replace-button').hidden = true;
+  $('#video-facts').textContent = nextMode === 'image' ? 'No image selected' : 'No video selected';
+  $('#video-mode').classList.toggle('active', nextMode === 'video');
+  $('#video-mode').setAttribute('aria-selected', String(nextMode === 'video'));
+  $('#image-mode').classList.toggle('active', nextMode === 'image');
+  $('#image-mode').setAttribute('aria-selected', String(nextMode === 'image'));
+  $('#choose-heading').textContent = nextMode === 'image' ? 'Choose an image' : 'Choose a video';
+  $('#choose-hint').textContent = nextMode === 'image' ? 'JPG, PNG, or WebP · Up to 200 MB' : 'MP4, MOV, or WebM · Up to 200 MB and 3 minutes';
+  $('#drop-title').textContent = nextMode === 'image' ? 'Drop your image here' : 'Drop your video here';
+  $('#output-format').textContent = nextMode === 'image' ? 'PNG image' : 'MP4 video + audio';
+  $('#tip-copy').textContent = nextMode === 'image'
+    ? 'Cover the complete mark with a little margin. The AI reconstructs only the selected area.'
+    : 'Keep the watermark inside the selected box for the whole clip. Each frame is repaired separately, so moving backgrounds are not covered by a frozen patch.';
+  $('#honesty-copy').textContent = nextMode === 'image'
+    ? 'AI estimates the missing pixels in the selected area; it cannot recover the original hidden image data. Your image stays in this browser.'
+    : 'Every frame runs through AI separately, so processing takes longer and results may vary slightly between frames. The selected box stays at the same screen position. The model is cached on your device.';
+  fileInput.accept = nextMode === 'image' ? 'image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp' : 'video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm';
+  rect = { x: 0.68, y: 0.65, w: 0.22, h: 0.2 };
+  paintSelection();
+  updateButton();
+}
+
 video.addEventListener('loadedmetadata', () => {
+  if (mediaMode !== 'video') return;
   if (!Number.isFinite(video.duration)) {
     currentFile = null;
     updateButton();
@@ -110,7 +221,7 @@ video.addEventListener('loadedmetadata', () => {
 });
 
 video.addEventListener('error', () => {
-  if (!currentFile) return;
+  if (!currentFile || mediaMode !== 'video') return;
   currentFile = null;
   selection.hidden = true;
   stage.classList.add('is-empty');
@@ -126,7 +237,9 @@ function formatDuration(seconds) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} min`;
 }
 
-fileInput.addEventListener('change', (event) => loadVideo(event.target.files?.[0]));
+fileInput.addEventListener('change', (event) => mediaMode === 'image' ? loadImage(event.target.files?.[0]) : loadVideo(event.target.files?.[0]));
+$('#video-mode').addEventListener('click', () => setMode('video'));
+$('#image-mode').addEventListener('click', () => setMode('image'));
 $('#replace-button').addEventListener('click', () => fileInput.click());
 const dropzone = $('#dropzone');
 dropzone.addEventListener('dragover', (event) => { event.preventDefault(); dropzone.classList.add('dragover'); });
@@ -134,7 +247,7 @@ dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover
 dropzone.addEventListener('drop', (event) => {
   event.preventDefault();
   dropzone.classList.remove('dragover');
-  loadVideo(event.dataTransfer.files?.[0]);
+  mediaMode === 'image' ? loadImage(event.dataTransfer.files?.[0]) : loadVideo(event.dataTransfer.files?.[0]);
 });
 
 $('#authorization-check').addEventListener('change', updateButton);
@@ -150,10 +263,12 @@ function pointerPoint(event) {
 
 function getContentRect() {
   const bounds = stage.getBoundingClientRect();
-  if (!video.videoWidth || !video.videoHeight) return { left: 0, top: 0, width: bounds.width, height: bounds.height };
-  const scale = Math.min(bounds.width / video.videoWidth, bounds.height / video.videoHeight);
-  const width = video.videoWidth * scale;
-  const height = video.videoHeight * scale;
+  const mediaWidth = mediaMode === 'image' ? sourceImage.naturalWidth : video.videoWidth;
+  const mediaHeight = mediaMode === 'image' ? sourceImage.naturalHeight : video.videoHeight;
+  if (!mediaWidth || !mediaHeight) return { left: 0, top: 0, width: bounds.width, height: bounds.height };
+  const scale = Math.min(bounds.width / mediaWidth, bounds.height / mediaHeight);
+  const width = mediaWidth * scale;
+  const height = mediaHeight * scale;
   return { left: (bounds.width - width) / 2, top: (bounds.height - height) / 2, width, height };
 }
 
@@ -234,10 +349,13 @@ async function processVideo() {
     if (outputURL) URL.revokeObjectURL(outputURL);
     outputURL = URL.createObjectURL(blob);
     resultVideo.src = outputURL;
+    resultVideo.hidden = false;
+    resultImage.hidden = true;
     resultVideo.load();
     $('#result-preview').hidden = false;
     $('#download-button').href = outputURL;
     $('#download-button').download = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.${ext}`;
+    $('#download-button').textContent = 'Download edited video ↓';
     $('#download-button').hidden = false;
     setProgress(100, `AI complete · ${getBackend().toUpperCase()} · video ready`);
     showToast('AI processing is complete. Review the preview before downloading.');
@@ -255,7 +373,62 @@ async function processVideo() {
   }
 }
 
-processButton.addEventListener('click', processVideo);
+async function processImage() {
+  if (!currentFile || !sourceImage.naturalWidth || !$('#authorization-check').checked || processing) return;
+  processing = true;
+  updateButton();
+  $('#download-button').hidden = true;
+  $('#progress-wrap').hidden = false;
+  try {
+    setProgress(3, 'Loading AI model…');
+    await initInpainter((progress) => {
+      const pct = progress.total ? 5 + 25 * progress.done / progress.total : 4;
+      setProgress(pct, progress.stage || 'Preparing AI model…');
+    });
+
+    const width = sourceImage.naturalWidth;
+    const height = sourceImage.naturalHeight;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(sourceImage, 0, 0, width, height);
+    const frame = context.getImageData(0, 0, width, height);
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = width;
+    maskCanvas.height = height;
+    const maskContext = maskCanvas.getContext('2d', { willReadFrequently: true });
+    maskContext.fillStyle = '#fff';
+    maskContext.fillRect(Math.round(rect.x * width), Math.round(rect.y * height), Math.max(1, Math.round(rect.w * width)), Math.max(1, Math.round(rect.h * height)));
+    const mask = maskContext.getImageData(0, 0, width, height);
+
+    setProgress(35, 'Removing selected area with AI…');
+    const repaired = await inpaint(frame, mask, { quality: 'standard' });
+    context.putImageData(repaired, 0, 0);
+    const blob = await new Promise((resolve, reject) => canvas.toBlob((imageBlob) => imageBlob ? resolve(imageBlob) : reject(new Error('Could not export the edited image.')), 'image/png'));
+    if (outputURL) URL.revokeObjectURL(outputURL);
+    outputURL = URL.createObjectURL(blob);
+    resultVideo.hidden = true;
+    resultImage.src = outputURL;
+    resultImage.hidden = false;
+    $('#result-preview').hidden = false;
+    $('#download-button').href = outputURL;
+    $('#download-button').download = `${currentFile.name.replace(/\.[^.]+$/, '')}-framefix.png`;
+    $('#download-button').textContent = 'Download edited image ↓';
+    $('#download-button').hidden = false;
+    setProgress(100, 'AI image ready');
+    showToast('Image edit is complete. Review it before downloading.');
+  } catch (error) {
+    console.error('Local image processing failed', error);
+    showToast(error.message || 'Image processing failed. Try a smaller image.');
+    $('#progress-wrap').hidden = true;
+  } finally {
+    processing = false;
+    updateButton();
+  }
+}
+
+processButton.addEventListener('click', () => mediaMode === 'image' ? processImage() : processVideo());
 window.addEventListener('resize', paintSelection);
 window.addEventListener('beforeunload', () => {
   if (sourceURL) URL.revokeObjectURL(sourceURL);

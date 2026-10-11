@@ -5,6 +5,7 @@ FrameFix is a static GitHub Pages video editor that performs AI inpainting in th
 ## What it does
 
 - Upload and preview MP4, MOV, and WebM clips.
+- Upload JPG, PNG, or WebP images for single-image inpainting and PNG export.
 - Drag and resize a rectangular selection over the watermark.
 - Run MI-GAN image inpainting on the selected area of every frame.
 - Export the repaired frames with the source playback timing and audio track.
