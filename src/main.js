@@ -196,6 +196,13 @@ async function processVideo() {
   updateButton();
   $('#download-button').hidden = true;
   $('#progress-wrap').hidden = false;
+  // Unlock Web Audio synchronously from the user's click for Safari/WebKit,
+  // where HTMLMediaElement.captureStream() is unavailable.
+  const nativeAudioCapture = video.captureStream || video.mozCaptureStream;
+  const audioContext = !nativeAudioCapture && window.AudioContext ? new AudioContext() : null;
+  const audioContextReady = audioContext?.resume().catch((error) => {
+    console.warn('Could not unlock Web Audio before processing', error);
+  });
   try {
     $('#process-label').textContent = 'Loading AI model…';
     await initInpainter((progress) => {
@@ -222,7 +229,7 @@ async function processVideo() {
       maskImageData: mask,
       inpaintFn: (frame) => inpaint(frame, mask, { quality: 'standard' }),
       onProgress: (pct, label) => setProgress(30 + pct * 0.7, label),
-      opts: { includeAudio: true, mimeType: preferredMime },
+      opts: { includeAudio: true, mimeType: preferredMime, audioContext },
     });
     if (outputURL) URL.revokeObjectURL(outputURL);
     outputURL = URL.createObjectURL(blob);
@@ -239,6 +246,10 @@ async function processVideo() {
     showToast(error.message || 'Processing stopped. Try a shorter or lower-resolution video.');
     $('#progress-wrap').hidden = true;
   } finally {
+    await audioContextReady;
+    if (audioContext && audioContext.state !== 'closed') {
+      await audioContext.close().catch(() => {});
+    }
     processing = false;
     updateButton();
   }

@@ -14,9 +14,9 @@
  *        - draw the patch on top (only paints the masked area)
  *      Use requestVideoFrameCallback for frame-accurate, real-time capture.
  *
- *   4. MediaRecorder captures the output canvas at 30fps + the original audio
- *      track in real time. Result: a video of identical duration with the
- *      watermark replaced by the patch.
+ *   4. MediaRecorder captures the output canvas whenever a new frame is drawn
+ *      + the original audio track in real time. Result: a video of identical
+ *      duration with the watermark replaced by the patch.
  *
  * Why playback-based instead of seek-based:
  *   MediaRecorder records in WALL-CLOCK time. captureStream(0) with manual
@@ -28,8 +28,6 @@
  *   1× AI inference (~10–20s on WASM, ~2-3s on WebGPU) + video duration.
  *   A 10s clip → ~20–30s total. (No way to go faster without changing models.)
  */
-
-const PREFERRED_FPS = 30;
 
 export async function loadVideoMetadata(file) {
   const url = URL.createObjectURL(file);
@@ -51,7 +49,6 @@ export async function loadVideoMetadata(file) {
     width: video.videoWidth,
     height: video.videoHeight,
     duration: video.duration,
-    fps: PREFERRED_FPS,
     revoke: () => URL.revokeObjectURL(url),
   };
 }
@@ -101,7 +98,6 @@ function buildPatchCanvas(inpaintedImage, maskImage, featherRadius = 6) {
  * Process a video. Returns a Blob of the output video.
  */
 export async function processVideo({ video, maskImageData, inpaintFn, onProgress, opts = {} }) {
-  const fps = opts.fps || PREFERRED_FPS;
   const width = video.videoWidth;
   const height = video.videoHeight;
   const duration = video.duration;
@@ -136,16 +132,19 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
   outCanvas.height = height;
   const outCtx = outCanvas.getContext('2d');
 
-  // captureStream(fps) — automatic capture at the requested rate
-  const canvasStream = outCanvas.captureStream(fps);
+  // Capture on canvas changes so 24/25/30/60fps sources are not all forced
+  // through a fixed 30fps sampler (which can duplicate or drop frames).
+  const canvasStream = outCanvas.captureStream();
   const videoTrack = canvasStream.getVideoTracks()[0];
   if (!videoTrack) throw new Error('captureStream returned no video track');
 
-  // Audio: pull directly from the source video's MediaElement
+  // Audio: use native media-element capture where available. Safari/WebKit
+  // does not currently implement it, so route the decoded audio through a
+  // Web Audio MediaStreamDestination instead.
   let audioTrack = null;
   if (opts.includeAudio !== false) {
     try {
-      // Source video must be playing for captureStream() to yield an audio track
+      video.muted = false;
       const srcStream = video.captureStream ? video.captureStream() : video.mozCaptureStream?.();
       if (srcStream) {
         const at = srcStream.getAudioTracks()[0];
@@ -153,6 +152,16 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
       }
     } catch (e) {
       console.warn('[video] Could not capture audio:', e);
+    }
+    if (!audioTrack && opts.audioContext) {
+      try {
+        const audioSource = opts.audioContext.createMediaElementSource(video);
+        const audioDestination = opts.audioContext.createMediaStreamDestination();
+        audioSource.connect(audioDestination);
+        audioTrack = audioDestination.stream.getAudioTracks()[0] || null;
+      } catch (e) {
+        console.warn('[video] Web Audio fallback could not capture audio:', e);
+      }
     }
   }
 
@@ -177,7 +186,9 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
   // ===== Step 4: Play video and capture =====
   onProgress?.(15, 'Recording — playing through video');
   video.currentTime = 0;
-  video.muted = opts.includeAudio === false;  // mute the source video if we don't want audio
+  // Keep the element unmuted while recording so its captured audio remains
+  // audible in the MediaStream. (This is also the audio the user hears.)
+  video.muted = opts.includeAudio === false;
 
   // Draw first frame BEFORE starting recorder so it's not blank
   await new Promise(r => video.addEventListener('seeked', r, { once: true }));
@@ -191,7 +202,6 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
 
   await new Promise((resolve, reject) => {
     let frameCount = 0;
-    const totalFrames = Math.max(1, Math.floor(duration * fps));
     let lastReportedPct = 15;
     const playStart = performance.now();
 
@@ -241,8 +251,6 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
 
   // ===== Step 5: Finalize =====
   onProgress?.(99, 'Encoding final frames');
-  // Wait a touch so the last frame settles into the encoder
-  await new Promise(r => setTimeout(r, 300));
   recorder.stop();
   await recordingDone;
   video.pause();
