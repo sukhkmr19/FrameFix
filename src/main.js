@@ -11,6 +11,8 @@ const fileInput = $('#file-input');
 const processButton = $('#process-button');
 const MAX_SIZE = 200 * 1024 * 1024;
 const MAX_DURATION = 180;
+const MAX_SELECTION_AREA = 0.12;
+const MAX_SELECTION_DIMENSION = 0.4;
 
 let currentFile = null;
 let sourceURL = null;
@@ -36,6 +38,7 @@ function paintSelection() {
   selection.style.height = `${rect.h * content.height}px`;
   $('#area-width').innerHTML = `${Math.round(rect.w * 100)}%<small> width</small>`;
   $('#area-height').innerHTML = `${Math.round(rect.h * 100)}%<small> height</small>`;
+  updateButton();
 }
 
 function setProgress(value, label) {
@@ -46,9 +49,15 @@ function setProgress(value, label) {
 }
 
 function updateButton() {
-  const ready = currentFile && video.videoWidth > 0 && $('#authorization-check').checked && !processing;
+  const selectionTooLarge = rect.w * rect.h > MAX_SELECTION_AREA || rect.w > MAX_SELECTION_DIMENSION || rect.h > MAX_SELECTION_DIMENSION;
+  const warning = $('#selection-warning');
+  warning.hidden = !currentFile || !selectionTooLarge;
+  if (currentFile && selectionTooLarge) {
+    warning.textContent = `This selection covers ${Math.round(rect.w * 100)}% × ${Math.round(rect.h * 100)}% of the frame. Large masks can invent objects. Resize the box tightly around the logo to continue.`;
+  }
+  const ready = currentFile && video.videoWidth > 0 && $('#authorization-check').checked && !processing && !selectionTooLarge;
   processButton.disabled = !ready;
-  $('#process-label').textContent = processing ? 'Processing…' : ready ? 'Remove watermark' : currentFile ? 'Loading preview…' : 'Choose a video';
+  $('#process-label').textContent = processing ? 'Processing…' : selectionTooLarge && currentFile ? 'Resize around the logo' : ready ? 'Remove watermark' : currentFile ? 'Loading preview…' : 'Choose a video';
 }
 
 function loadVideo(file) {

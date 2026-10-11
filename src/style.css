@@ -9,3 +9,5 @@
 /* Keep the product mark aligned with the wordmark in the header. */
 .brand-mark-image{display:block;width:36px;height:36px;flex:0 0 36px;object-fit:contain;border-radius:8px}
 @media(max-width:380px){.brand{gap:8px}.brand-mark-image{width:32px;height:32px;flex-basis:32px}}
+.selection-warning{margin:10px 0 0;color:#9b3f34;font-size:11px;line-height:1.5}
+@media(prefers-color-scheme:dark){.selection-warning{color:#ffaaa0}}
