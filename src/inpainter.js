@@ -66,6 +66,7 @@ const QUALITY_PRESETS = {
 const DEFAULT_QUALITY = 'standard';
 
 let session = null;
+let sessionPromise = null;
 let activeBackend = 'unknown';
 
 export function getBackend() {
@@ -84,18 +85,36 @@ export function getPassCount(quality) {
   return (QUALITY_PRESETS[quality] ?? QUALITY_PRESETS[DEFAULT_QUALITY]).contexts.length;
 }
 
-export async function init(onProgress) {
-  if (session) return session;
+export function init(onProgress) {
+  if (session) return Promise.resolve(session);
+  if (sessionPromise) return sessionPromise;
+  sessionPromise = initializeSession(onProgress).catch((error) => {
+    sessionPromise = null;
+    throw error;
+  });
+  return sessionPromise;
+}
+
+async function initializeSession(onProgress) {
   // Configure ORT before creating session
   ort.env.wasm.wasmPaths = { wasm: jsepWasmUrl, mjs: jsepMjsUrl };
-  ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 4);
+  ort.env.wasm.numThreads = globalThis.crossOriginIsolated
+    ? Math.min(navigator.hardwareConcurrency || 4, 4)
+    : 1;
   ort.env.wasm.simd = true;
-  // proxy=true runs ALL ORT work (model parsing AND inference) in a Web Worker
-  // so the main thread / UI never freezes during a long inpaint. Requires COI
-  // for the worker to have shared memory; if COI isn't on, ORT silently falls
-  // back to main-thread mode (slower UI, still works).
-  ort.env.wasm.proxy = true;
   ort.env.logLevel = 'warning';
+
+  // ORT's WASM proxy worker cannot be used with the WebGPU EP. Probe the
+  // adapter first, then create exactly one session with a compatible setup.
+  // This Vite/GitHub Pages build also cannot load ORT's proxy module reliably,
+  // so keep WASM on the main thread instead of failing inside the worker.
+  let adapter = null;
+  try {
+    adapter = await navigator.gpu?.requestAdapter();
+  } catch { /* WebGPU is optional; WASM remains available. */ }
+  const useWebGpu = Boolean(adapter);
+  if (useWebGpu) ort.env.webgpu.adapter = adapter;
+  ort.env.wasm.proxy = false;
 
   // Track whether the model came from cache, so the loader UI stays correct
   // through subsequent ORT init progress callbacks.
@@ -109,46 +128,35 @@ export async function init(onProgress) {
   wrappedProgress({ stage: 'Looking for model on this device…', done: 0, total: 0 });
   const modelBytes = await loadModel(wrappedProgress);
 
-  // Try execution providers in order: webgpu → webgl → wasm
-  const providers = ['webgpu', 'webgl', 'wasm'];
-  let lastErr = null;
-
-  for (const ep of providers) {
-    try {
-      wrappedProgress({
-        stage: `Initializing ${ep.toUpperCase()}…`,
-        done: modelBytes.byteLength,
-        total: modelBytes.byteLength,
-      });
-      session = await ort.InferenceSession.create(modelBytes, {
-        executionProviders: [ep],
-        graphOptimizationLevel: 'all',
-      });
-      activeBackend = ep;
-      // Log model's input/output specs so we can verify the format we expect.
-      const inputNames = Array.from(session.inputNames || []);
-      const outputNames = Array.from(session.outputNames || []);
-      console.log(`[inpainter] Active backend: ${ep}`);
-      console.log(`[inpainter] Model inputs:`, inputNames);
-      console.log(`[inpainter] Model outputs:`, outputNames);
-      wrappedProgress({
-        stage: 'Ready',
-        done: modelBytes.byteLength,
-        total: modelBytes.byteLength,
-        ready: true,
-        backend: ep,
-      });
-      return session;
-    } catch (e) {
-      // EXPECTED in many browsers: WebGPU isn't on (Safari/Firefox), or WebGL
-      // can't handle int64 ops in this model. We fall back to WASM.
-      // Demoted to info-level so it doesn't look like a real error.
-      console.info(`[inpainter] ${ep} not available (will try next backend):`, e?.message || e);
-      lastErr = e;
-    }
+  const providers = useWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+  wrappedProgress({
+    stage: `Initializing ${useWebGpu ? 'WEBGPU with WASM fallback' : 'WASM'}…`,
+    done: modelBytes.byteLength,
+    total: modelBytes.byteLength,
+  });
+  try {
+    session = await ort.InferenceSession.create(modelBytes, {
+      executionProviders: providers,
+      graphOptimizationLevel: 'all',
+    });
+  } catch (error) {
+    throw new Error(`Could not initialize the ${providers.join(' + ')} backend: ${error?.message || error}`);
   }
 
-  throw new Error(`No usable ONNX backend. Last error: ${lastErr?.message || lastErr}`);
+  activeBackend = useWebGpu ? 'webgpu + wasm fallback' : 'wasm';
+  const inputNames = Array.from(session.inputNames || []);
+  const outputNames = Array.from(session.outputNames || []);
+  console.log(`[inpainter] Requested backends: ${providers.join(' → ')}`);
+  console.log('[inpainter] Model inputs:', inputNames);
+  console.log('[inpainter] Model outputs:', outputNames);
+  wrappedProgress({
+    stage: 'Ready',
+    done: modelBytes.byteLength,
+    total: modelBytes.byteLength,
+    ready: true,
+    backend: activeBackend,
+  });
+  return session;
 }
 
 /**
