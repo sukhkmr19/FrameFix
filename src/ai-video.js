@@ -118,7 +118,10 @@ async function collectFrameTimes(video, duration, onProgress) {
   });
 }
 
-async function makePatchBlob(inpainted, mask, bounds) {
+async function makePatchBlob(inpainted, bounds) {
+  // `inpainted` is already composited with a feathered edge. Preserve those
+  // repaired pixels as-is; blurring this patch again softens the repair and
+  // creates a visible ghost around otherwise sharp marks.
   const base = document.createElement('canvas');
   base.width = bounds.width;
   base.height = bounds.height;
@@ -126,28 +129,18 @@ async function makePatchBlob(inpainted, mask, bounds) {
   const patch = context.createImageData(bounds.width, bounds.height);
   for (let y = 0; y < bounds.height; y++) {
     for (let x = 0; x < bounds.width; x++) {
-      const sourceIndex = ((bounds.y + y) * mask.width + bounds.x + x) * 4;
+      const sourceIndex = ((bounds.y + y) * inpainted.width + bounds.x + x) * 4;
       const targetIndex = (y * bounds.width + x) * 4;
-      if (mask.data[sourceIndex + 3] > 16) {
-        patch.data[targetIndex] = inpainted.data[sourceIndex];
-        patch.data[targetIndex + 1] = inpainted.data[sourceIndex + 1];
-        patch.data[targetIndex + 2] = inpainted.data[sourceIndex + 2];
-        patch.data[targetIndex + 3] = 255;
-      }
+      patch.data[targetIndex] = inpainted.data[sourceIndex];
+      patch.data[targetIndex + 1] = inpainted.data[sourceIndex + 1];
+      patch.data[targetIndex + 2] = inpainted.data[sourceIndex + 2];
+      patch.data[targetIndex + 3] = 255;
     }
   }
   context.putImageData(patch, 0, 0);
 
-  const softened = document.createElement('canvas');
-  softened.width = bounds.width;
-  softened.height = bounds.height;
-  const softContext = softened.getContext('2d');
-  softContext.filter = 'blur(6px)';
-  softContext.drawImage(base, 0, 0);
-  softContext.filter = 'none';
-
   return new Promise((resolve, reject) => {
-    softened.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Could not prepare an inpainted frame.')), 'image/webp', 0.96);
+    base.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Could not prepare an inpainted frame.')), 'image/png');
   });
 }
 
@@ -207,7 +200,7 @@ export async function processVideo({ video, maskImageData, inpaintFn, onProgress
     frameContext.drawImage(video, 0, 0, width, height);
     const frame = frameContext.getImageData(0, 0, width, height);
     const repaired = await inpaintFn(frame, maskImageData);
-    patchBlobs.push(await makePatchBlob(repaired, maskImageData, bounds));
+    patchBlobs.push(await makePatchBlob(repaired, bounds));
     if (i % 2 === 0 || i === frameTimes.length - 1) {
       const completed = i + 1;
       const averageMs = (performance.now() - frameProcessingStartedAt) / completed;
